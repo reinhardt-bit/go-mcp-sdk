@@ -1,0 +1,1099 @@
+./
+examples/
+  client/
+    main.go
+  combined/
+    main.go
+  echo/
+    main.go
+go.mod
+mcp/
+  client.go
+  mcp_test.go
+  protocol.go
+  server.go
+  transports/
+    sse.go
+    stdio.go
+
+--- examples/client/main.go ---
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp"
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp/transports"
+)
+
+func main() {
+    // Use stdio transport to connect to the server
+    transport := transports.NewStdioTransport()
+    client := mcp.NewClient(transport)
+
+    // Test ListPrompts
+    prompts, err := client.ListPrompts()
+    if err != nil {
+        log.Fatal("ListPrompts failed:", err)
+    }
+    fmt.Println("Prompts:", prompts)
+
+    // Test GetResource
+    type EchoParams struct {
+        Message string `json:"message"`
+    }
+    type EchoResponse struct {
+        Echo string `json:"echo"`
+    }
+    rawResp, err := client.GetResource("echo", EchoParams{Message: "hello world"})
+    if err != nil {
+        log.Fatal("GetResource failed:", err)
+    }
+    var resp EchoResponse
+    if err := json.Unmarshal(rawResp, &resp); err != nil {
+        log.Fatal("Unmarshal failed:", err)
+    }
+    fmt.Println("Echo Response:", resp.Echo)
+
+    // Clean up
+    if err := client.Close(); err != nil {
+        log.Fatal("Close failed:", err)
+    }
+}
+
+
+--- examples/combined/main.go ---
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp"
+)
+
+func main() {
+    // Create pipes for communication
+    sr, cw := io.Pipe() // Server reads, Client writes
+    cr, sw := io.Pipe() // Client reads, Server writes
+
+    serverTransport := &testTransport{Reader: sr, Writer: sw}
+    clientTransport := &testTransport{Reader: cr, Writer: cw}
+
+    // Start the server
+    server := mcp.NewServer()
+    type EchoParams struct {
+        Message string `json:"message"`
+    }
+    type EchoResponse struct {
+        Echo string `json:"echo"`
+    }
+    server.RegisterResource("echo", mcp.NewResource(func(params EchoParams) (EchoResponse, error) {
+        return EchoResponse{Echo: params.Message}, nil
+    }))
+    server.RegisterPrompt(mcp.Prompt{Name: "greeting", Template: "Hello, {{name}}!"})
+    go server.Serve(serverTransport)
+
+    // Start the client
+    client := mcp.NewClient(clientTransport)
+
+    // Test ListPrompts
+    prompts, err := client.ListPrompts()
+    if err != nil {
+        log.Fatal("ListPrompts failed:", err)
+    }
+    fmt.Println("Prompts:", prompts)
+
+    // Test GetResource
+    rawResp, err := client.GetResource("echo", EchoParams{Message: "hello world"})
+    if err != nil {
+        log.Fatal("GetResource failed:", err)
+    }
+    var resp EchoResponse
+    if err := json.Unmarshal(rawResp, &resp); err != nil {
+        log.Fatal("Unmarshal failed:", err)
+    }
+    fmt.Println("Echo Response:", resp.Echo)
+
+    // Clean up
+    if err := client.Close(); err != nil {
+        log.Fatal("Close failed:", err)
+    }
+}
+
+// testTransport mimics the transport interface for testing
+type testTransport struct {
+    Reader io.Reader
+    Writer io.Writer
+}
+
+func (t *testTransport) ReadMessage() (json.RawMessage, error) {
+    var buf bytes.Buffer
+    _, err := io.CopyN(&buf, t.Reader, 1024) // Arbitrary limit
+    if err != nil && err != io.EOF {
+        return nil, err
+    }
+    data := bytes.TrimSpace(buf.Bytes())
+    if len(data) == 0 {
+        return nil, io.EOF
+    }
+    var msg json.RawMessage
+    if err := json.Unmarshal(data, &msg); err != nil {
+        return nil, err
+    }
+    return msg, nil
+}
+
+func (t *testTransport) WriteMessage(message json.RawMessage) error {
+    _, err := t.Writer.Write(append(message, '\n'))
+    return err
+}
+
+func (t *testTransport) Close() error {
+    return nil
+}
+
+
+--- examples/echo/main.go ---
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp"
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp/transports"
+)
+
+func main() {
+	// Create and configure the server
+	server := mcp.NewServer()
+	server.SetOnStart(func() error {
+		fmt.Println("Server starting...")
+		return nil
+	})
+	server.SetOnStop(func() error {
+		fmt.Println("Server stopping...")
+		return nil
+	})
+
+	// Register an echo resource
+	type EchoParams struct {
+		Message string `json:"message"`
+	}
+	type EchoResponse struct {
+		Echo string `json:"echo"`
+	}
+	server.RegisterResource("echo", mcp.NewResource(func(params EchoParams) (EchoResponse, error) {
+		return EchoResponse{Echo: params.Message}, nil
+	}))
+
+	// Register a prompt
+	server.RegisterPrompt(mcp.Prompt{
+		Name:     "greeting",
+		Template: "Hello, {{name}}!",
+	})
+
+	// Serve over stdio
+	transport := transports.NewStdioTransport()
+	if err := server.Serve(transport); err != nil {
+		log.Fatal(err)
+	}
+}
+
+
+
+--- mcp/client.go ---
+package mcp
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp/transports"
+)
+
+// Client interacts with an MCP server, sending requests and handling responses/notifications.
+type Client struct {
+	transport            transports.Transport
+	notificationHandlers map[string]NotificationHandler
+	pendingRequests      map[int]chan responseChan // Changed from interface{}
+	mu                   sync.Mutex
+	nextID               int
+	stop                 chan struct{}
+	wg                   sync.WaitGroup
+}
+
+// NotificationHandler handles incoming notifications.
+type NotificationHandler func(method string, params json.RawMessage) error
+
+type responseChan struct {
+	result json.RawMessage
+	err    *RPCError
+}
+
+// NewClient creates a new MCP client instance with the given transport.
+func NewClient(transport transports.Transport) *Client {
+	c := &Client{
+		transport:            transport,
+		notificationHandlers: make(map[string]NotificationHandler),
+		pendingRequests:      make(map[int]chan responseChan),
+		stop:                 make(chan struct{}),
+	}
+	c.wg.Add(1)
+	go c.readLoop()
+	return c
+}
+
+// handleMessage processes incoming messages.
+func (c *Client) handleMessage(msg json.RawMessage) {
+	var m map[string]interface{}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		fmt.Println("Client handleMessage unmarshal error:", err)
+		return
+	}
+	if id, ok := m["id"]; ok {
+		var resp Response
+		if err := json.Unmarshal(msg, &resp); err != nil {
+			fmt.Println("Client handleMessage response unmarshal error:", err)
+			return
+		}
+		idInt := int(id.(float64))
+		c.mu.Lock()
+		ch, exists := c.pendingRequests[idInt]
+		if exists {
+			delete(c.pendingRequests, idInt)
+		}
+		c.mu.Unlock()
+		fmt.Println("Client handleMessage ID:", idInt, "exists:", exists)
+		if exists {
+			fmt.Println("Client sending response to channel:", string(resp.Result))
+			ch <- responseChan{result: resp.Result, err: resp.Error}
+			close(ch)
+		}
+	}
+}
+
+// CallRaw performs a JSON-RPC call and returns the raw result.
+func (c *Client) CallRaw(method string, params interface{}) (json.RawMessage, error) {
+	c.mu.Lock()
+	id := c.nextID
+	c.nextID++
+	ch := make(chan responseChan, 1)
+	c.pendingRequests[id] = ch
+	c.mu.Unlock()
+
+	req := Request{
+		JSONRPC: "2.0",
+		Method:  method,
+		ID:      id,
+	}
+	if params != nil {
+		p, err := json.Marshal(params)
+		if err != nil {
+			c.mu.Lock()
+			delete(c.pendingRequests, id)
+			c.mu.Unlock()
+			return nil, err
+		}
+		req.Params = p
+	}
+	data, err := json.Marshal(req)
+	if err != nil {
+		c.mu.Lock()
+		delete(c.pendingRequests, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+	fmt.Println("Client sending request:", string(data))
+	if err := c.transport.WriteMessage(data); err != nil {
+		c.mu.Lock()
+		delete(c.pendingRequests, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+
+	fmt.Println("Client waiting for response on ID:", id)
+	resp := <-ch
+	fmt.Println("Client received response:", resp.result, "err:", resp.err)
+	if resp.err != nil {
+		return nil, fmt.Errorf("rpc error: %s", resp.err.Message)
+	}
+	return resp.result, nil
+}
+
+func (c *Client) readLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.stop:
+			fmt.Println("Client readLoop stopped")
+			return
+		default:
+			msg, err := c.transport.ReadMessage()
+			if err == io.EOF {
+				fmt.Println("Client readLoop received EOF, stopping")
+				return
+			}
+			if err != nil {
+				fmt.Println("Client readLoop error:", err)
+				return
+			}
+			fmt.Println("Client readLoop received:", string(msg))
+			c.handleMessage(msg)
+		}
+	}
+}
+
+// Call provides a type-safe wrapper around CallRaw.
+func Call[Resp any](c *Client, method string, params interface{}) (Resp, error) {
+	raw, err := c.CallRaw(method, params)
+	if err != nil {
+		return *new(Resp), err
+	}
+	var resp Resp
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return *new(Resp), err
+		}
+	}
+	return resp, nil
+}
+
+// RegisterNotificationHandler registers a handler for a specific notification method.
+func (c *Client) RegisterNotificationHandler(method string, handler NotificationHandler) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.notificationHandlers[method] = handler
+}
+
+// Close shuts down the client.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	close(c.stop)
+	c.mu.Unlock()
+	c.wg.Wait()
+	return c.transport.Close()
+}
+
+// ListPrompts calls the "listPrompts" method with type safety.
+func (c *Client) ListPrompts() (map[string]Prompt, error) {
+	return Call[map[string]Prompt](c, "listPrompts", nil)
+}
+
+// GetPrompt calls the "getPrompt" method with type safety.
+func (c *Client) GetPrompt(name string) (Prompt, error) {
+	params := map[string]string{"name": name}
+	return Call[Prompt](c, "getPrompt", params)
+}
+
+// GetResource calls the "getResource" method and returns the raw result.
+func (c *Client) GetResource(name string, params interface{}) (json.RawMessage, error) {
+	req := struct {
+		Name   string      `json:"name"`
+		Params interface{} `json:"params,omitempty"`
+	}{
+		Name:   name,
+		Params: params,
+	}
+	return c.CallRaw("getResource", req)
+}
+
+// ExecuteTool calls the "executeTool" method and returns the raw result.
+func (c *Client) ExecuteTool(name string, params interface{}) (json.RawMessage, error) {
+	req := struct {
+		Name   string      `json:"name"`
+		Params interface{} `json:"params,omitempty"`
+	}{
+		Name:   name,
+		Params: params,
+	}
+	return c.CallRaw("executeTool", req)
+}
+
+// GetResourceTyped provides a type-safe wrapper for GetResource.
+func GetResource[Resp any](c *Client, name string, params interface{}) (Resp, error) {
+	raw, err := c.GetResource(name, params)
+	if err != nil {
+		return *new(Resp), err
+	}
+	var resp Resp
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return *new(Resp), err
+		}
+	}
+	return resp, nil
+}
+
+// ExecuteToolTyped provides a type-safe wrapper for ExecuteTool.
+func ExecuteTool[Resp any](c *Client, name string, params interface{}) (Resp, error) {
+	raw, err := c.ExecuteTool(name, params)
+	if err != nil {
+		return *new(Resp), err
+	}
+	var resp Resp
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return *new(Resp), err
+		}
+	}
+	return resp, nil
+}
+
+type Error struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+
+--- mcp/mcp_test.go ---
+package mcp
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"io"
+	"testing"
+	"time"
+)
+
+func TestServerClientIntegration(t *testing.T) {
+    t.Log("Starting test")
+
+    sr, cw := io.Pipe()
+    cr, sw := io.Pipe()
+
+    serverTransport := &testTransport{Reader: sr, Writer: sw}
+    clientTransport := &testTransport{Reader: cr, Writer: cw}
+
+    server := NewServer()
+    type TestParams struct {
+        Value int `json:"value"`
+    }
+    type TestResponse struct {
+        Double int `json:"double"`
+    }
+    server.RegisterResource("double", NewResource(func(params TestParams) (TestResponse, error) {
+        return TestResponse{Double: params.Value * 2}, nil
+    }))
+    server.RegisterPrompt(Prompt{Name: "test", Template: "Test {{value}}"})
+    t.Log("Server configured")
+
+    done := make(chan struct{})
+    go func() {
+        t.Log("Server starting")
+        err := server.Serve(serverTransport)
+        t.Logf("Server stopped with err: %v", err)
+        close(done)
+    }()
+
+    time.Sleep(100 * time.Millisecond)
+
+    client := NewClient(clientTransport)
+    t.Log("Client created")
+
+    resultChan := make(chan error)
+    go func() {
+        t.Log("Sending ListPrompts request")
+        prompts, err := client.ListPrompts()
+        if err != nil {
+            resultChan <- err
+            return
+        }
+        t.Logf("ListPrompts result: %v", prompts)
+        if len(prompts) != 1 || prompts["test"].Template != "Test {{value}}" {
+            resultChan <- fmt.Errorf("expected prompt 'test', got %v", prompts)
+            return
+        }
+
+        t.Log("Sending GetResource request")
+        rawResp, err := client.GetResource("double", TestParams{Value: 5})
+        if err != nil {
+            resultChan <- err
+            return
+        }
+        t.Logf("GetResource raw response: %s", rawResp)
+        var resp TestResponse
+        if err := json.Unmarshal(rawResp, &resp); err != nil {
+            resultChan <- err
+            return
+        }
+        t.Logf("GetResource parsed response: %+v", resp)
+        if resp.Double != 10 {
+            resultChan <- fmt.Errorf("expected Double=10, got %d", resp.Double)
+            return
+        }
+
+        resultChan <- nil
+    }()
+
+    select {
+    case err := <-resultChan:
+        if err != nil {
+            t.Fatal(err)
+        }
+    case <-time.After(5 * time.Second):
+        t.Fatal("Client requests timed out after 5 seconds")
+    }
+
+    t.Log("Closing client")
+    if err := client.Close(); err != nil {
+        t.Fatalf("Close failed: %v", err)
+    }
+    cw.Close()
+    sw.Close()
+
+    t.Log("Waiting for server to stop")
+    select {
+    case <-done:
+        t.Log("Server stopped successfully")
+    case <-time.After(5 * time.Second):
+        t.Fatal("Test timed out after 5 seconds")
+    }
+    t.Log("Test completed")
+}
+
+type testTransport struct {
+    Reader io.Reader
+    Writer io.WriteCloser
+}
+
+func (t *testTransport) ReadMessage() (json.RawMessage, error) {
+    reader := bufio.NewReader(t.Reader)
+    line, err := reader.ReadBytes('\n')
+    if err != nil {
+        return nil, err
+    }
+    var msg json.RawMessage
+    if err := json.Unmarshal(line, &msg); err != nil {
+        return nil, err
+    }
+    return msg, nil
+}
+
+func (t *testTransport) WriteMessage(message json.RawMessage) error {
+    _, err := t.Writer.Write(append(message, '\n'))
+    return err
+}
+
+func (t *testTransport) Close() error {
+    return t.Writer.Close()
+}
+
+
+--- mcp/protocol.go ---
+package mcp
+
+import "encoding/json"
+
+// Request represents a JSON-RPC 2.0 request.
+type Request struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	ID      interface{}     `json:"id"`
+}
+
+// Response represents a JSON-RPC 2.0 response.
+type Response struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *RPCError       `json:"error,omitempty"`
+	ID      interface{}     `json:"id"`
+}
+
+// Notification represents a JSON-RPC 2.0 notification (no ID).
+type Notification struct {
+	JSONRPC string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+// RPCError represents a JSON-RPC 2.0 error object.
+type RPCError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+
+--- mcp/server.go ---
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/reinhardt-bit/go-mcp-sdk/mcp/transports"
+)
+
+// Server handles MCP server-side logic, processing requests and sending responses/notifications.
+type Server struct {
+	handlers         map[string]HandlerFunc
+	prompts          map[string]Prompt
+	resourceHandlers map[string]Handler
+	toolHandlers     map[string]Handler
+	onStart          func() error
+	onStop           func() error
+	transport        transports.Transport
+	mu               sync.Mutex
+}
+
+// Handler defines the interface for handling JSON-RPC requests.
+type Handler interface {
+	ServeJSONRPC(ctx context.Context, params json.RawMessage) (interface{}, error)
+}
+
+// HandlerFunc is a function type for handling JSON-RPC requests.
+type HandlerFunc func(ctx context.Context, params json.RawMessage) (interface{}, error)
+
+// ServeJSONRPC implements the Handler interface for HandlerFunc.
+func (f HandlerFunc) ServeJSONRPC(ctx context.Context, params json.RawMessage) (interface{}, error) {
+	return f(ctx, params)
+}
+
+// Prompt represents an MCP prompt template.
+type Prompt struct {
+	Name     string
+	Template string
+}
+
+// Resource defines a generic resource handler.
+type Resource[Req, Resp any] struct {
+	Handler func(Req) (Resp, error)
+}
+
+// ServeJSONRPC implements the Handler interface for Resource.
+func (r Resource[Req, Resp]) ServeJSONRPC(ctx context.Context, params json.RawMessage) (interface{}, error) {
+	var req struct {
+		Name   string          `json:"name"`
+		Params json.RawMessage `json:"params,omitempty"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, err
+	}
+	var p Req
+	if len(req.Params) > 0 {
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			return nil, err
+		}
+	}
+	return r.Handler(p)
+}
+
+// Tool defines a generic tool handler.
+type Tool[Req, Resp any] struct {
+	Execute func(Req) (Resp, error)
+}
+
+// ServeJSONRPC implements the Handler interface for Tool.
+func (t Tool[Req, Resp]) ServeJSONRPC(ctx context.Context, params json.RawMessage) (interface{}, error) {
+	var req struct {
+		Name   string          `json:"name"`
+		Params json.RawMessage `json:"params,omitempty"`
+	}
+	if err := json.Unmarshal(params, &req); err != nil {
+		return nil, err
+	}
+	var p Req
+	if err := json.Unmarshal(req.Params, &p); err != nil {
+		return nil, err
+	}
+	return t.Execute(p)
+}
+
+// NewResource creates a new resource handler.
+func NewResource[Req, Resp any](handler func(Req) (Resp, error)) Handler {
+	return Resource[Req, Resp]{Handler: handler}
+}
+
+// NewTool creates a new tool handler.
+func NewTool[Req, Resp any](execute func(Req) (Resp, error)) Handler {
+	return Tool[Req, Resp]{Execute: execute}
+}
+
+// NewServer creates a new MCP server instance.
+func NewServer() *Server {
+	s := &Server{
+		handlers:         make(map[string]HandlerFunc),
+		prompts:          make(map[string]Prompt),
+		resourceHandlers: make(map[string]Handler),
+		toolHandlers:     make(map[string]Handler),
+	}
+	s.handlers["listPrompts"] = s.listPromptsHandler()
+	s.handlers["getPrompt"] = s.getPromptHandler()
+	s.handlers["getResource"] = s.getResourceHandler()
+	s.handlers["executeTool"] = s.executeToolHandler()
+	return s
+}
+
+// RegisterHandler registers a handler for a method.
+func (s *Server) RegisterHandler(method string, handler HandlerFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handlers[method] = handler
+}
+
+// RegisterResource registers a resource with a specific name.
+func (s *Server) RegisterResource(name string, handler Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resourceHandlers[name] = handler
+}
+
+// RegisterTool registers a tool with a specific name.
+func (s *Server) RegisterTool(name string, handler Handler) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolHandlers[name] = handler
+}
+
+// RegisterPrompt registers a prompt template.
+func (s *Server) RegisterPrompt(prompt Prompt) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prompts[prompt.Name] = prompt
+}
+
+// SetOnStart sets the startup hook.
+func (s *Server) SetOnStart(handler func() error) {
+	s.onStart = handler
+}
+
+// SetOnStop sets the shutdown hook.
+func (s *Server) SetOnStop(handler func() error) {
+	s.onStop = handler
+}
+
+// SendNotification sends a notification to the client.
+func (s *Server) SendNotification(method string, params interface{}) error {
+	p, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	n := Notification{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  p,
+	}
+	data, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	return s.transport.WriteMessage(data)
+}
+
+// Serve starts the server with the given transport.
+func (s *Server) Serve(transport transports.Transport) error {
+	s.transport = transport
+
+	for {
+		msg, err := transport.ReadMessage()
+		if err == io.EOF {
+			fmt.Println("Server received EOF, stopping")
+			return nil
+		}
+		if err != nil {
+			fmt.Println("Server read error:", err)
+			return err
+		}
+		fmt.Println("Server received message:", string(msg))
+		go s.handleMessage(msg)
+	}
+}
+
+func (s *Server) handleMessage(msg json.RawMessage) {
+	var req Request
+	if err := json.Unmarshal(msg, &req); err != nil {
+		fmt.Println("Server unmarshal error:", err)
+		s.sendError(nil, -32700, "Parse error", nil)
+		return
+	}
+	fmt.Println("Server processing request:", req.Method, "ID:", req.ID)
+	if req.JSONRPC != "2.0" {
+		s.sendError(req.ID, -32600, "Invalid Request", nil)
+		return
+	}
+	handler, ok := s.handlers[req.Method]
+	if !ok {
+		s.sendError(req.ID, -32601, "Method not found", nil)
+		return
+	}
+	ctx := context.Background()
+	result, err := handler(ctx, req.Params)
+	resp := Response{
+		JSONRPC: "2.0",
+		ID:      req.ID,
+	}
+	if err != nil {
+		resp.Error = &RPCError{
+			Code:    -32000,
+			Message: err.Error(),
+		}
+	} else if result != nil {
+		resp.Result, _ = json.Marshal(result)
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		fmt.Println("Error marchaling response:", err)
+		return
+	}
+	s.transport.WriteMessage(data)
+}
+
+func (s *Server) sendError(id interface{}, code int, message string, errorData interface{}) {
+	resp := Response{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &RPCError{
+			Code:    code,
+			Message: message,
+			Data:    errorData,
+		},
+	}
+	data, err := json.Marshal(resp) // Use = instead of := if data is already declared, or handle properly
+	if err != nil {
+		fmt.Println("Error marshaling error response:", err)
+		return
+	}
+	s.transport.WriteMessage(data)
+}
+
+// listPromptsHandler returns a handler for the "listPrompts" method.
+func (s *Server) listPromptsHandler() HandlerFunc {
+	return func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.prompts, nil
+	}
+}
+
+// getPromptHandler returns a handler for the "getPrompt" method.
+func (s *Server) getPromptHandler() HandlerFunc {
+	return func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		prompt, ok := s.prompts[p.Name]
+		if !ok {
+			return nil, fmt.Errorf("prompt not found: %s", p.Name)
+		}
+		return prompt, nil
+	}
+}
+
+// getResourceHandler returns a handler for the "getResource" method.
+func (s *Server) getResourceHandler() HandlerFunc {
+	return func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		handler, ok := s.resourceHandlers[p.Name]
+		s.mu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("resource not found: %s", p.Name)
+		}
+		return handler.ServeJSONRPC(ctx, params)
+	}
+}
+
+// executeToolHandler returns a handler for the "executeTool" method.
+func (s *Server) executeToolHandler() HandlerFunc {
+	return func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		var p struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		handler, ok := s.toolHandlers[p.Name]
+		s.mu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("tool not found: %s", p.Name)
+		}
+		return handler.ServeJSONRPC(ctx, params)
+	}
+}
+
+
+--- mcp/transports/sse.go ---
+package transports
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sync"
+)
+
+// SSETransport implements the Transport interface using Server-Sent Events.
+type SSETransport struct {
+	url       string
+	client    *http.Client
+	eventChan chan json.RawMessage
+	stop      chan struct{}
+	wg        sync.WaitGroup
+}
+
+// NewSSETransport creates a new SSE transport instance.
+func NewSSETransport(url string) *SSETransport {
+	t := &SSETransport{
+		url:       url,
+		client:    &http.Client{},
+		eventChan: make(chan json.RawMessage),
+		stop:      make(chan struct{}),
+	}
+	t.wg.Add(1)
+	go t.readLoop()
+	return t
+}
+
+// readLoop reads SSE events from the server.
+func (t *SSETransport) readLoop() {
+	defer t.wg.Done()
+	req, _ := http.NewRequest("GET", t.url+"/events", nil)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	reader := bufio.NewReader(resp.Body)
+	for {
+		select {
+		case <-t.stop:
+			return
+		default:
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if bytes.HasPrefix([]byte(line), []byte("data: ")) {
+				data := bytes.TrimPrefix([]byte(line), []byte("data: "))
+				data = bytes.TrimSpace(data)
+				var msg json.RawMessage
+				if json.Unmarshal(data, &msg) == nil {
+					t.eventChan <- msg
+				}
+			}
+		}
+	}
+}
+
+// ReadMessage reads a message from the SSE event channel.
+func (t *SSETransport) ReadMessage() (json.RawMessage, error) {
+	select {
+	case msg := <-t.eventChan:
+		return msg, nil
+	case <-t.stop:
+		return nil, io.EOF
+	}
+}
+
+// WriteMessage sends a message to the server via HTTP POST.
+func (t *SSETransport) WriteMessage(message json.RawMessage) error {
+	resp, err := t.client.Post(t.url+"/request", "application/json", bytes.NewReader(message))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// Close shuts down the SSE transport.
+func (t *SSETransport) Close() error {
+	close(t.stop)
+	t.wg.Wait()
+	return nil
+}
+
+
+--- mcp/transports/stdio.go ---
+package transports
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"os"
+	"sync"
+)
+
+// Transport defines the interface for MCP communication.
+type Transport interface {
+	ReadMessage() (json.RawMessage, error)
+	WriteMessage(message json.RawMessage) error
+	Close() error
+}
+
+// StdioTransport implements the Transport interface using stdin and stdout.
+type StdioTransport struct {
+	reader *bufio.Reader
+	writer io.Writer
+	mu     sync.Mutex
+}
+
+// NewStdioTransport creates a new stdio transport instance.
+func NewStdioTransport() *StdioTransport {
+	return &StdioTransport{
+		reader: bufio.NewReader(os.Stdin),
+		writer: os.Stdout,
+	}
+}
+
+// ReadMessage reads a JSON-RPC message from stdin.
+func (t *StdioTransport) ReadMessage() (json.RawMessage, error) {
+	line, err := t.reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	var msg json.RawMessage
+	if err := json.Unmarshal([]byte(line), &msg); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// WriteMessage writes a JSON-RPC message to stdout.
+func (t *StdioTransport) WriteMessage(message json.RawMessage) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	_, err := t.writer.Write(message)
+	if err != nil {
+		return err
+	}
+	_, err = t.writer.Write([]byte("\n"))
+	return err
+}
+
+// Close closes the transport (no-op for stdio).
+func (t *StdioTransport) Close() error {
+	return nil
+}

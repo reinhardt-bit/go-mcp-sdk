@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/reinhardt-bit/go-mcp-sdk/mcp/transports"
@@ -12,7 +13,7 @@ import (
 type Client struct {
 	transport            transports.Transport
 	notificationHandlers map[string]NotificationHandler
-	pendingRequests      map[interface{}]chan responseChan
+	pendingRequests      map[int]chan responseChan // Changed from interface{}
 	mu                   sync.Mutex
 	nextID               int
 	stop                 chan struct{}
@@ -32,8 +33,7 @@ func NewClient(transport transports.Transport) *Client {
 	c := &Client{
 		transport:            transport,
 		notificationHandlers: make(map[string]NotificationHandler),
-		pendingRequests:      make(map[interface{}]chan responseChan),
-		nextID:               1,
+		pendingRequests:      make(map[int]chan responseChan),
 		stop:                 make(chan struct{}),
 	}
 	c.wg.Add(1)
@@ -41,52 +41,48 @@ func NewClient(transport transports.Transport) *Client {
 	return c
 }
 
-// readLoop processes incoming messages from the transport.
-func (c *Client) readLoop() {
-	defer c.wg.Done()
-	for {
-		select {
-		case <-c.stop:
-			return
-		default:
-			msg, err := c.transport.ReadMessage()
-			if err != nil {
-				return
-			}
-			c.handleMessage(msg)
-		}
-	}
-}
+// // readLoop processes incoming messages from the transport.
+// func (c *Client) readLoop() {
+// 	defer c.wg.Done()
+// 	for {
+// 		select {
+// 		case <-c.stop:
+// 			return
+// 		default:
+// 			msg, err := c.transport.ReadMessage()
+// 			if err != nil {
+// 				return
+// 			}
+// 			c.handleMessage(msg)
+// 		}
+// 	}
+// }
 
 // handleMessage processes incoming messages.
 func (c *Client) handleMessage(msg json.RawMessage) {
 	var m map[string]interface{}
 	if err := json.Unmarshal(msg, &m); err != nil {
+		fmt.Println("Client handleMessage unmarshal error:", err)
 		return
 	}
 	if id, ok := m["id"]; ok {
 		var resp Response
 		if err := json.Unmarshal(msg, &resp); err != nil {
+			fmt.Println("Client handleMessage response unmarshal error:", err)
 			return
 		}
+		idInt := int(id.(float64))
 		c.mu.Lock()
-		ch, exists := c.pendingRequests[id]
+		ch, exists := c.pendingRequests[idInt]
 		if exists {
-			delete(c.pendingRequests, id)
+			delete(c.pendingRequests, idInt)
 		}
 		c.mu.Unlock()
+		fmt.Println("Client handleMessage ID:", idInt, "exists:", exists)
 		if exists {
+			fmt.Println("Client sending response to channel:", string(resp.Result))
 			ch <- responseChan{result: resp.Result, err: resp.Error}
 			close(ch)
-		}
-	} else if method, ok := m["method"].(string); ok {
-		c.mu.Lock()
-		handler, exists := c.notificationHandlers[method]
-		c.mu.Unlock()
-		if exists {
-			var n Notification
-			json.Unmarshal(msg, &n)
-			handler(method, n.Params)
 		}
 	}
 }
@@ -96,6 +92,8 @@ func (c *Client) CallRaw(method string, params interface{}) (json.RawMessage, er
 	c.mu.Lock()
 	id := c.nextID
 	c.nextID++
+	ch := make(chan responseChan, 1)
+	c.pendingRequests[id] = ch
 	c.mu.Unlock()
 
 	req := Request{
@@ -106,28 +104,58 @@ func (c *Client) CallRaw(method string, params interface{}) (json.RawMessage, er
 	if params != nil {
 		p, err := json.Marshal(params)
 		if err != nil {
+			c.mu.Lock()
+			delete(c.pendingRequests, id)
+			c.mu.Unlock()
 			return nil, err
 		}
 		req.Params = p
 	}
 	data, err := json.Marshal(req)
 	if err != nil {
+		c.mu.Lock()
+		delete(c.pendingRequests, id)
+		c.mu.Unlock()
 		return nil, err
 	}
+	fmt.Println("Client sending request:", string(data))
 	if err := c.transport.WriteMessage(data); err != nil {
+		c.mu.Lock()
+		delete(c.pendingRequests, id)
+		c.mu.Unlock()
 		return nil, err
 	}
 
-	ch := make(chan responseChan, 1)
-	c.mu.Lock()
-	c.pendingRequests[id] = ch
-	c.mu.Unlock()
-
+	fmt.Println("Client waiting for response on ID:", id)
 	resp := <-ch
+	fmt.Println("Client received response:", resp.result, "err:", resp.err)
 	if resp.err != nil {
 		return nil, fmt.Errorf("rpc error: %s", resp.err.Message)
 	}
 	return resp.result, nil
+}
+
+func (c *Client) readLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.stop:
+			fmt.Println("Client readLoop stopped")
+			return
+		default:
+			msg, err := c.transport.ReadMessage()
+			if err == io.EOF {
+				fmt.Println("Client readLoop received EOF, stopping")
+				return
+			}
+			if err != nil {
+				fmt.Println("Client readLoop error:", err)
+				return
+			}
+			fmt.Println("Client readLoop received:", string(msg))
+			c.handleMessage(msg)
+		}
+	}
 }
 
 // Call provides a type-safe wrapper around CallRaw.
@@ -154,7 +182,9 @@ func (c *Client) RegisterNotificationHandler(method string, handler Notification
 
 // Close shuts down the client.
 func (c *Client) Close() error {
+	c.mu.Lock()
 	close(c.stop)
+	c.mu.Unlock()
 	c.wg.Wait()
 	return c.transport.Close()
 }
@@ -223,3 +253,29 @@ func ExecuteTool[Resp any](c *Client, name string, params interface{}) (Resp, er
 	}
 	return resp, nil
 }
+
+// type Request struct {
+// 	JSONRPC string          `json:"jsonrpc"`
+// 	Method  string          `json:"method"`
+// 	Params  json.RawMessage `json:"params,omitempty"`
+// 	ID      int             `json:"id"`
+// }
+
+// type Response struct {
+// 	JSONRPC string          `json:"jsonrpc"`
+// 	Result  json.RawMessage `json:"result,omitempty"`
+// 	Error   *Error          `json:"error,omitempty"`
+// 	ID      int             `json:"id"`
+// }
+
+type Error struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// type responseChan struct {
+// 	result json.RawMessage
+// 	err    *Error
+// }
+
+// type NotificationHandler func(method string, params json.RawMessage)

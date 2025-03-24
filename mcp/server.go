@@ -169,25 +169,27 @@ func (s *Server) SendNotification(method string, params interface{}) error {
 // Serve starts the server with the given transport.
 func (s *Server) Serve(transport transports.Transport) error {
 	s.transport = transport
-	if s.onStart != nil {
-		if err := s.onStart(); err != nil {
-			return err
-		}
-	}
-	defer func() {
-		if s.onStop != nil {
-			s.onStop()
-		}
-	}()
-
+	// if s.onStart != nil {
+	// 	if err := s.onStart(); err != nil {
+	// 		return err
+	// 	}
+	// }
+	// defer func() {
+	// 	if s.onStop != nil {
+	// 		s.onStop()
+	// 	}
+	// }()
 	for {
 		msg, err := transport.ReadMessage()
 		if err == io.EOF {
+			fmt.Println("Server received EOF, stopping")
 			return nil
 		}
 		if err != nil {
+			fmt.Println("Server read error:", err)
 			return err
 		}
+		fmt.Println("Server received message:", string(msg))
 		go s.handleMessage(msg)
 	}
 }
@@ -195,9 +197,11 @@ func (s *Server) Serve(transport transports.Transport) error {
 func (s *Server) handleMessage(msg json.RawMessage) {
 	var req Request
 	if err := json.Unmarshal(msg, &req); err != nil {
+		fmt.Println("Server unmarshal error:", err)
 		s.sendError(nil, -32700, "Parse error", nil)
 		return
 	}
+	fmt.Println("Server processing request:", req.Method, "ID:", req.ID)
 	if req.JSONRPC != "2.0" {
 		s.sendError(req.ID, -32600, "Invalid Request", nil)
 		return
